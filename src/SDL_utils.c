@@ -123,7 +123,7 @@ static SDL_HashTable *SDL_objects;
 
 static Uint32 SDL_HashObject(const void *key, void *unused)
 {
-    return (Uint32)(uintptr_t)key;
+    return (Uint32)((uintptr_t)key & 0xffffffffu);
 }
 
 static SDL_bool SDL_KeyMatchObject(const void *a, const void *b, void *unused)
