@@ -1138,6 +1138,7 @@ static SDL_bool D3D12_QueryFence(
     SDL_GpuRenderer *driverData,
     SDL_GpuFence *fence)
 {
+    (void)driverData;
     D3D12Fence *d3d12Fence = (D3D12Fence *)fence;
     return ID3D12Fence_GetCompletedValue(d3d12Fence->handle) == D3D12_FENCE_SIGNAL_VALUE;
 }
@@ -2063,13 +2064,13 @@ static D3D12ComputeRootSignature *D3D12_INTERNAL_CreateComputeRootSignature(
     SDL_zeroa(descriptorRanges);
     SDL_zero(rootParameter);
 
-    d3d12ComputeRootSignature->readOnlyStorageTextureRootIndex = -1;
-    d3d12ComputeRootSignature->readOnlyStorageBufferRootIndex = -1;
-    d3d12ComputeRootSignature->readWriteStorageTextureRootIndex = -1;
-    d3d12ComputeRootSignature->readWriteStorageBufferRootIndex = -1;
+    d3d12ComputeRootSignature->readOnlyStorageTextureRootIndex = (Uint32)-1;
+    d3d12ComputeRootSignature->readOnlyStorageBufferRootIndex = (Uint32)-1;
+    d3d12ComputeRootSignature->readWriteStorageTextureRootIndex = (Uint32)-1;
+    d3d12ComputeRootSignature->readWriteStorageBufferRootIndex = (Uint32)-1;
 
     for (Uint32 i = 0; i < MAX_UNIFORM_BUFFERS_PER_STAGE; i += 1) {
-        d3d12ComputeRootSignature->uniformBufferRootIndex[i] = -1;
+        d3d12ComputeRootSignature->uniformBufferRootIndex[i] = (Uint32)-1;
     }
 
     if (createInfo->readOnlyStorageTextureCount) {
@@ -2673,13 +2674,21 @@ static D3D12Texture *D3D12_INTERNAL_CreateTexture(
 
     heapFlags = D3D12_HEAP_FLAG_NONE;
 
+    if (((textureCreateInfo->depth <= 1) && (!textureCreateInfo->isCube) && (textureCreateInfo->layerCount > UINT16_MAX))
+        || ((textureCreateInfo->depth > 1) && (textureCreateInfo->depth > UINT16_MAX))
+        || (textureCreateInfo->levelCount > UINT16_MAX)) {
+        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to create texture! Argument out of range.");
+        D3D12_INTERNAL_DestroyTexture(renderer, texture);
+        return NULL;
+    }
+
     if (textureCreateInfo->depth <= 1) {
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         desc.Width = textureCreateInfo->width;
         desc.Height = textureCreateInfo->height;
-        desc.DepthOrArraySize = textureCreateInfo->isCube ? 6 : textureCreateInfo->layerCount;
-        desc.MipLevels = textureCreateInfo->levelCount;
+        desc.DepthOrArraySize = textureCreateInfo->isCube ? 6 : (UINT16)textureCreateInfo->layerCount;
+        desc.MipLevels = (UINT16)textureCreateInfo->levelCount;
         desc.Format = SDLToD3D12_TextureFormat[textureCreateInfo->format];
         desc.SampleDesc.Count = 1;
         desc.SampleDesc.Quality = 0;
@@ -2690,8 +2699,8 @@ static D3D12Texture *D3D12_INTERNAL_CreateTexture(
         desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         desc.Width = textureCreateInfo->width;
         desc.Height = textureCreateInfo->height;
-        desc.DepthOrArraySize = textureCreateInfo->depth;
-        desc.MipLevels = textureCreateInfo->levelCount;
+        desc.DepthOrArraySize = (UINT16)textureCreateInfo->depth;
+        desc.MipLevels = (UINT16)textureCreateInfo->levelCount;
         desc.Format = SDLToD3D12_TextureFormat[textureCreateInfo->format];
         desc.SampleDesc.Count = 1;
         desc.SampleDesc.Quality = 0;
@@ -2808,7 +2817,7 @@ static D3D12Texture *D3D12_INTERNAL_CreateTexture(
                     rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
                     rtvDesc.Texture3D.MipSlice = levelIndex;
                     rtvDesc.Texture3D.FirstWSlice = 0;
-                    rtvDesc.Texture3D.WSize = -1; /* all depths */
+                    rtvDesc.Texture3D.WSize = (UINT)-1; /* all depths */
                 } else {
                     rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
                     rtvDesc.Texture2D.MipSlice = levelIndex;
@@ -3365,7 +3374,7 @@ static void D3D12_ReleaseShader(
     SDL_GpuRenderer *driverData,
     SDL_GpuShader *shader)
 {
-    /* D3D12Renderer *renderer = (D3D12Renderer *)driverData; */
+    (void)driverData;
     D3D12Shader *d3d12shader = (D3D12Shader *)shader;
 
     if (d3d12shader->bytecode) {
@@ -3764,7 +3773,7 @@ static void D3D12_BeginRenderPass(
                 subresource->dsvHandle.cpuHandle,
                 clearFlags,
                 depthStencilAttachmentInfo->depthStencilClearValue.depth,
-                depthStencilAttachmentInfo->depthStencilClearValue.stencil,
+                (Uint8)depthStencilAttachmentInfo->depthStencilClearValue.stencil,
                 0,
                 NULL);
         }
@@ -4455,6 +4464,7 @@ static void D3D12_DrawPrimitivesIndirect(
     Uint32 drawCount,
     Uint32 stride)
 {
+    (void)stride;
     D3D12CommandBuffer *d3d12CommandBuffer = (D3D12CommandBuffer *)commandBuffer;
     D3D12Buffer *d3d12Buffer = ((D3D12BufferContainer *)buffer)->activeBuffer;
 
@@ -4477,6 +4487,7 @@ static void D3D12_DrawIndexedPrimitivesIndirect(
     Uint32 drawCount,
     Uint32 stride)
 {
+    (void)stride;
     D3D12CommandBuffer *d3d12CommandBuffer = (D3D12CommandBuffer *)commandBuffer;
     D3D12Buffer *d3d12Buffer = ((D3D12BufferContainer *)buffer)->activeBuffer;
 
@@ -5251,6 +5262,7 @@ static SDL_bool D3D12_SupportsSwapchainComposition(
     SDL_Window *window,
     SDL_GpuSwapchainComposition swapchainComposition)
 {
+    (void)window;
     D3D12Renderer *renderer = (D3D12Renderer *)driverData;
     DXGI_FORMAT format;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport;
@@ -5774,6 +5786,7 @@ static SDL_GpuTextureFormat D3D12_GetSwapchainTextureFormat(
     SDL_GpuRenderer *driverData,
     SDL_Window *window)
 {
+    (void)driverData;
     D3D12WindowData *windowData = D3D12_INTERNAL_FetchWindowData(window);
 
     if (windowData == NULL) {
@@ -6064,7 +6077,7 @@ static SDL_GpuTexture *D3D12_AcquireSwapchainTexture(
     IDXGISwapChain_GetDesc(windowData->swapchain, &swapchainDesc);
     SDL_GetWindowSize(window, &w, &h);
 
-    if (w != swapchainDesc.BufferDesc.Width || h != swapchainDesc.BufferDesc.Height) {
+    if ((INT64)w != (INT64)swapchainDesc.BufferDesc.Width || (INT64)h != (INT64)swapchainDesc.BufferDesc.Height) {
         res = D3D12_INTERNAL_ResizeSwapchain(
             renderer,
             windowData,
@@ -6356,9 +6369,14 @@ static void D3D12_Submit(
 
     /* Acquire a fence and set it to the in-flight fence */
     d3d12CommandBuffer->inFlightFence = D3D12_INTERNAL_AcquireFence(renderer);
+
+    /* Fence creation can fail, we can't handle this nicely */
     if (!d3d12CommandBuffer->inFlightFence) {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to acquire fence.");
+        SDL_assert(d3d12CommandBuffer->inFlightFence);
+        return;
     }
+
     /* Command buffer has a reference to the in-flight fence */
     (void)SDL_AtomicIncRef(&d3d12CommandBuffer->inFlightFence->referenceCount);
 
@@ -6740,6 +6758,8 @@ static SDL_bool D3D12_PrepareDriver(SDL_VideoDevice *_this)
     IDXGIFactory4 *factory4;
     IDXGIFactory6 *factory6;
     IDXGIAdapter1 *adapter;
+
+    (void)_this;
 
     /* Can we load D3D12? */
 
