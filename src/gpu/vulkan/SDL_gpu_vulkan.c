@@ -468,12 +468,6 @@ static VkSamplerAddressMode SDLToVK_SamplerAddressMode[] = {
     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
 };
 
-static VkQueryType SDLToVK_QueryType[] = {
-    VK_QUERY_TYPE_TIMESTAMP,
-    VK_QUERY_TYPE_OCCLUSION,
-    VK_QUERY_TYPE_OCCLUSION
-};
-
 // Structures
 
 typedef struct VulkanRenderer VulkanRenderer;
@@ -484,6 +478,7 @@ typedef struct VulkanBufferContainer VulkanBufferContainer;
 typedef struct VulkanUniformBuffer VulkanUniformBuffer;
 typedef struct VulkanTexture VulkanTexture;
 typedef struct VulkanTextureContainer VulkanTextureContainer;
+typedef struct VulkanQueryPool VulkanQueryPool;
 
 typedef struct VulkanFenceHandle
 {
@@ -973,12 +968,22 @@ typedef struct FramebufferHashTableKey
     Uint32 height;
 } FramebufferHashTableKey;
 
-typedef struct VulkanQueryPool
+typedef struct VulkanQuery
+{
+    VulkanQueryPool *pool;
+    Uint32 index;
+    VulkanFenceHandle *inFlightFence;
+} VulkanQuery;
+
+struct VulkanQueryPool
 {
     VkQueryPool pool;
-    SDL_GPUQueryType type;
-    SDL_AtomicInt referenceCount;
-} VulkanQueryPool;
+    VkQueryType type;
+    Uint32 nextIndex; // ring buffer style
+    VulkanBuffer *transferBuffer;
+
+    VulkanQuery queries[1024];
+};
 
 // Command structures
 
@@ -1123,10 +1128,6 @@ typedef struct VulkanCommandBuffer
     Sint32 usedComputePipelineCount;
     Sint32 usedComputePipelineCapacity;
 
-    VulkanQueryPool **usedQueryPools;
-    Sint32 usedQueryPoolCount;
-    Sint32 usedQueryPoolCapacity;
-
     VulkanFramebuffer **usedFramebuffers;
     Sint32 usedFramebufferCount;
     Sint32 usedFramebufferCapacity;
@@ -1238,6 +1239,9 @@ struct VulkanRenderer
     Uint32 descriptorSetCachePoolCount;
     Uint32 descriptorSetCachePoolCapacity;
 
+    VulkanQueryPool timestampQueryPool;
+    VulkanQueryPool occlusionQueryPool;
+
     SDL_AtomicInt layoutResourceID;
 
     Uint32 minUBOAlignment;
@@ -1267,10 +1271,6 @@ struct VulkanRenderer
     VulkanShader **shadersToDestroy;
     Uint32 shadersToDestroyCount;
     Uint32 shadersToDestroyCapacity;
-
-    VulkanQueryPool **queryPoolsToDestroy;
-    Uint32 queryPoolsToDestroyCount;
-    Uint32 queryPoolsToDestroyCapacity;
 
     VulkanFramebuffer **framebuffersToDestroy;
     Uint32 framebuffersToDestroyCount;
@@ -2579,19 +2579,6 @@ static void VULKAN_INTERNAL_TrackComputePipeline(
         computePipeline->referenceCount);
 }
 
-static void VULKAN_INTERNAL_TrackQueryPool(
-    VulkanCommandBuffer *commandBuffer,
-    VulkanQueryPool *pool)
-{
-    TRACK_RESOURCE(
-        pool,
-        VulkanQueryPool *,
-        usedQueryPools,
-        usedQueryPoolCount,
-        usedQueryPoolCapacity,
-        pool->referenceCount);
-}
-
 static void VULKAN_INTERNAL_TrackFramebuffer(
     VulkanCommandBuffer *commandBuffer,
     VulkanFramebuffer *framebuffer)
@@ -3280,7 +3267,6 @@ static void VULKAN_INTERNAL_DestroyCommandPool(
         SDL_free(commandBuffer->usedSamplers);
         SDL_free(commandBuffer->usedGraphicsPipelines);
         SDL_free(commandBuffer->usedComputePipelines);
-        SDL_free(commandBuffer->usedQueryPools);
         SDL_free(commandBuffer->usedFramebuffers);
         SDL_free(commandBuffer->usedUniformBuffers);
 
@@ -3368,18 +3354,6 @@ static void VULKAN_INTERNAL_DestroySampler(
         NULL);
 
     SDL_free(vulkanSampler);
-}
-
-static void VULKAN_INTERNAL_DestroyQueryPool(
-    VulkanRenderer *renderer,
-    VulkanQueryPool *vulkanQueryPool)
-{
-    renderer->vkDestroyQueryPool(
-        renderer->logicalDevice,
-        vulkanQueryPool->pool,
-        NULL);
-
-    SDL_free(vulkanQueryPool);
 }
 
 static void VULKAN_INTERNAL_DestroySwapchainImage(
@@ -5106,6 +5080,16 @@ static void VULKAN_DestroyDevice(
     SDL_free(renderer->fencePool.availableFences);
     SDL_DestroyMutex(renderer->fencePool.lock);
 
+    renderer->vkDestroyQueryPool(
+        renderer->logicalDevice,
+        renderer->timestampQueryPool.pool,
+        NULL);
+
+    renderer->vkDestroyQueryPool(
+        renderer->logicalDevice,
+        renderer->occlusionQueryPool.pool,
+        NULL);
+
     SDL_DestroyHashTable(renderer->commandPoolHashTable);
     SDL_DestroyHashTable(renderer->renderPassHashTable);
     SDL_DestroyHashTable(renderer->framebufferHashTable);
@@ -5142,7 +5126,6 @@ static void VULKAN_DestroyDevice(
     SDL_free(renderer->computePipelinesToDestroy);
     SDL_free(renderer->shadersToDestroy);
     SDL_free(renderer->samplersToDestroy);
-    SDL_free(renderer->queryPoolsToDestroy);
     SDL_free(renderer->framebuffersToDestroy);
     SDL_free(renderer->allocationsToDefrag);
 
@@ -7123,46 +7106,6 @@ static SDL_GPUTransferBuffer *VULKAN_CreateTransferBuffer(
         debugName);
 }
 
-static float VULKAN_GetTimestampFrequency(SDL_GPURenderer *driverData)
-{
-    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
-    return renderer->physicalDeviceProperties.properties.limits.timestampPeriod;
-}
-
-static SDL_GPUQueryPool *VULKAN_CreateQueryPool(
-    SDL_GPURenderer *driverData,
-    SDL_GPUQueryPoolCreateInfo *createinfo)
-{
-    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
-    VkQueryPoolCreateInfo vkQueryPoolCreateInfo;
-    VkResult result;
-    VulkanQueryPool *pool = SDL_malloc(sizeof(VulkanQueryPool));
-
-    vkQueryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    vkQueryPoolCreateInfo.pNext = NULL;
-    vkQueryPoolCreateInfo.flags = VK_QUERY_POOL_CREATE_RESET_BIT_KHR;
-    vkQueryPoolCreateInfo.pipelineStatistics = 0;
-    vkQueryPoolCreateInfo.queryCount = createinfo->query_count;
-    vkQueryPoolCreateInfo.queryType = SDLToVK_QueryType[createinfo->type];
-
-    result = renderer->vkCreateQueryPool(
-        renderer->logicalDevice,
-        &vkQueryPoolCreateInfo,
-        NULL,
-        &pool->pool
-    );
-
-    if (result != VK_SUCCESS) {
-        SDL_free(pool);
-        CHECK_VULKAN_ERROR_AND_RETURN(result, vkCreateQueryPool, NULL);
-    }
-
-    SDL_SetAtomicInt(&pool->referenceCount, 0);
-    pool->type = createinfo->type;
-
-    return (SDL_GPUQueryPool *)pool;
-}
-
 static void VULKAN_INTERNAL_ReleaseTexture(
     VulkanRenderer *renderer,
     VulkanTexture *vulkanTexture)
@@ -7369,28 +7312,6 @@ static void VULKAN_ReleaseGraphicsPipeline(
 
     renderer->graphicsPipelinesToDestroy[renderer->graphicsPipelinesToDestroyCount] = vulkanGraphicsPipeline;
     renderer->graphicsPipelinesToDestroyCount += 1;
-
-    SDL_UnlockMutex(renderer->disposeLock);
-}
-
-static void VULKAN_ReleaseQueryPool(
-    SDL_GPURenderer *driverData,
-    SDL_GPUQueryPool *pool)
-{
-    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
-    VulkanQueryPool *vulkanQueryPool = (VulkanQueryPool *)pool;
-
-    SDL_LockMutex(renderer->disposeLock);
-
-    EXPAND_ARRAY_IF_NEEDED(
-        renderer->queryPoolsToDestroy,
-        VulkanQueryPool *,
-        renderer->queryPoolsToDestroyCount + 1,
-        renderer->queryPoolsToDestroyCapacity,
-        renderer->queryPoolsToDestroyCapacity * 2);
-
-    renderer->queryPoolsToDestroy[renderer->queryPoolsToDestroyCount] = vulkanQueryPool;
-    renderer->queryPoolsToDestroyCount += 1;
 
     SDL_UnlockMutex(renderer->disposeLock);
 }
@@ -9368,38 +9289,6 @@ static void VULKAN_CopyBufferToBuffer(
     SDL_UnlockRWLock(renderer->defragLock);
 }
 
-static void VULKAN_DownloadQueryResults(
-    SDL_GPUCommandBuffer *commandBuffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 firstQuery,
-    Uint32 count,
-    const SDL_GPUTransferBufferLocation *destination)
-{
-    VulkanCommandBuffer *vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
-    VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
-    VulkanQueryPool *vulkanQueryPool = (VulkanQueryPool *)pool;
-    VulkanBufferContainer *dstContainer = (VulkanBufferContainer *)destination->transfer_buffer;
-
-    SDL_LockRWLockForReading(renderer->defragLock);
-
-    // Note that the transfer buffer does not need a barrier, as it is synced by the client
-
-    renderer->vkCmdCopyQueryPoolResults(
-        vulkanCommandBuffer->commandBuffer,
-        vulkanQueryPool->pool,
-        firstQuery,
-        count,
-        dstContainer->activeBuffer->buffer,
-        destination->offset,
-        8, // Result for timing and occlusion is one 64-bit integer
-        VK_QUERY_RESULT_64_BIT);
-
-    VULKAN_INTERNAL_TrackQueryPool(vulkanCommandBuffer, vulkanQueryPool);
-    VULKAN_INTERNAL_TrackBuffer(vulkanCommandBuffer, dstContainer->activeBuffer);
-
-    SDL_UnlockRWLock(renderer->defragLock);
-}
-
 static void VULKAN_GenerateMipmaps(
     SDL_GPUCommandBuffer *commandBuffer,
     SDL_GPUTexture *texture)
@@ -9625,6 +9514,51 @@ static void VULKAN_Blit(
     VULKAN_INTERNAL_TrackTexture(vulkanCommandBuffer, dstSubresource->parent);
 }
 
+static VulkanFenceHandle *VULKAN_INTERNAL_AcquireFenceFromPool(
+    VulkanRenderer *renderer)
+{
+    VulkanFenceHandle *handle;
+    VkFenceCreateInfo fenceCreateInfo;
+    VkFence fence;
+    VkResult vulkanResult;
+
+    if (renderer->fencePool.availableFenceCount == 0) {
+        // Create fence
+        fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceCreateInfo.pNext = NULL;
+        fenceCreateInfo.flags = 0;
+
+        vulkanResult = renderer->vkCreateFence(
+            renderer->logicalDevice,
+            &fenceCreateInfo,
+            NULL,
+            &fence);
+
+        CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateFence, NULL);
+
+        handle = SDL_malloc(sizeof(VulkanFenceHandle));
+        handle->fence = fence;
+        SDL_SetAtomicInt(&handle->referenceCount, 0);
+        return handle;
+    }
+
+    SDL_LockMutex(renderer->fencePool.lock);
+
+    handle = renderer->fencePool.availableFences[renderer->fencePool.availableFenceCount - 1];
+    renderer->fencePool.availableFenceCount -= 1;
+
+    vulkanResult = renderer->vkResetFences(
+        renderer->logicalDevice,
+        1,
+        &handle->fence);
+
+    SDL_UnlockMutex(renderer->fencePool.lock);
+
+    CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkResetFences, NULL);
+
+    return handle;
+}
+
 static bool VULKAN_INTERNAL_AllocateCommandBuffer(
     VulkanRenderer *renderer,
     VulkanCommandPool *vulkanCommandPool)
@@ -9738,11 +9672,6 @@ static bool VULKAN_INTERNAL_AllocateCommandBuffer(
     commandBuffer->usedComputePipelineCount = 0;
     commandBuffer->usedComputePipelines = SDL_malloc(
         commandBuffer->usedComputePipelineCapacity * sizeof(VulkanComputePipeline *));
-
-    commandBuffer->usedQueryPoolCapacity = 4;
-    commandBuffer->usedQueryPoolCount = 0;
-    commandBuffer->usedQueryPools = SDL_malloc(
-        commandBuffer->usedQueryPoolCapacity * sizeof(VulkanQueryPool *));
 
     commandBuffer->usedFramebufferCapacity = 4;
     commandBuffer->usedFramebufferCount = 0;
@@ -9958,6 +9887,11 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
         return NULL;
     }
 
+    commandBuffer->inFlightFence = VULKAN_INTERNAL_AcquireFenceFromPool(renderer);
+    if (commandBuffer->inFlightFence == NULL) {
+        return NULL;
+    }
+
     return (SDL_GPUCommandBuffer *)commandBuffer;
 }
 
@@ -10011,57 +9945,166 @@ static void VULKAN_ReleaseFence(
     }
 }
 
-static void VULKAN_BeginQuery(
+static SDL_GPUQuery *VULKAN_BeginQuery(
     SDL_GPUCommandBuffer *commandBuffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 index)
+    SDL_GPUQueryType type,
+    SDL_PropertiesID props)
 {
     VulkanCommandBuffer *vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
     VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
-    VulkanQueryPool *vulkanQueryPool = (VulkanQueryPool *)pool;
+    VulkanQuery *query;
 
-    // Timestamp queries don't begin and end, we just need a distinction between
-    // a timestamp written when preceding commands are taken and when preceding commands are finished.
-    if (vulkanQueryPool->type == SDL_GPU_QUERY_TIMESTAMP) {
+    if (type == SDL_GPU_QUERY_TIME_INTERVAL)
+    {
+        renderer->vkCmdResetQueryPool(
+            vulkanCommandBuffer->commandBuffer,
+            renderer->timestampQueryPool.pool,
+            renderer->timestampQueryPool.nextIndex,
+            2);
+
+        query = &renderer->timestampQueryPool.queries[renderer->timestampQueryPool.nextIndex];
+
+        if (query->inFlightFence != NULL) {
+            SDL_SetError("Too many time interval queries submitted.");
+            return NULL;
+        }
+
+        renderer->timestampQueryPool.nextIndex = (renderer->timestampQueryPool.nextIndex + 2) % 1024;
+
+        // Timestamp queries don't begin and end, we just need a distinction between
+        // a timestamp written when preceding commands are taken and when preceding commands are finished.
         renderer->vkCmdWriteTimestamp(
             vulkanCommandBuffer->commandBuffer,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            vulkanQueryPool->pool,
-            index);
+            renderer->timestampQueryPool.pool,
+            query->index);
     }
-    else {
+    else
+    {
+        renderer->vkCmdResetQueryPool(
+            vulkanCommandBuffer->commandBuffer,
+            renderer->occlusionQueryPool.pool,
+            renderer->occlusionQueryPool.nextIndex,
+            1);
+
+        query = &renderer->occlusionQueryPool.queries[renderer->occlusionQueryPool.nextIndex];
+
+        if (query->inFlightFence != NULL) {
+            SDL_SetError("Too many occlusion queries submitted.");
+            return NULL;
+        }
+
+        renderer->occlusionQueryPool.nextIndex = (renderer->timestampQueryPool.nextIndex + 1) % 1024;
+
         renderer->vkCmdBeginQuery(
             vulkanCommandBuffer->commandBuffer,
-            vulkanQueryPool->pool,
-            index,
-            vulkanQueryPool->type == SDL_GPU_QUERY_PRECISE_OCCLUSION ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+            query->pool->pool,
+            query->index,
+            type == SDL_GPU_QUERY_PRECISE_OCCLUSION ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
+
+    query->inFlightFence = vulkanCommandBuffer->inFlightFence;
+    SDL_AtomicIncRef(&query->inFlightFence->referenceCount);
+
+    return (SDL_GPUQuery *)query;
 }
 
 static void VULKAN_EndQuery(
     SDL_GPUCommandBuffer *commandBuffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 index)
+    SDL_GPUQuery *query)
 {
+    VulkanQuery *vulkanQuery = (VulkanQuery *)query;
     VulkanCommandBuffer *vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
     VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
-    VulkanQueryPool *vulkanQueryPool = (VulkanQueryPool *)pool;
 
-    // Timestamp queries don't begin and end, we just need a distinction between
-    // a timestamp written when preceding commands are taken and when preceding commands are finished.
-    if (vulkanQueryPool->type == SDL_GPU_QUERY_TIMESTAMP) {
+    if (vulkanQuery->pool->type == VK_QUERY_TYPE_TIMESTAMP) {
+        // Timestamp queries don't begin and end, we just need a distinction between
+        // a timestamp written when preceding commands are taken and when preceding commands are finished.
+
         renderer->vkCmdWriteTimestamp(
             vulkanCommandBuffer->commandBuffer,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            vulkanQueryPool->pool,
-            index);
+            vulkanQuery->pool->pool,
+            vulkanQuery->index + 1); // write to the + 1 index so we can compare the timestamps
+
+        // Queue up a readback copy command
+        renderer->vkCmdCopyQueryPoolResults(
+            vulkanCommandBuffer->commandBuffer,
+            renderer->timestampQueryPool.pool,
+            vulkanQuery->index,
+            2,
+            renderer->timestampQueryPool.transferBuffer->buffer,
+            vulkanQuery->index * sizeof(Uint64),
+            sizeof(Uint64),
+            VK_QUERY_RESULT_64_BIT);
     }
     else {
         renderer->vkCmdEndQuery(
             vulkanCommandBuffer->commandBuffer,
-            vulkanQueryPool->pool,
-            index);
+            vulkanQuery->pool->pool,
+            vulkanQuery->index);
+
+        // Queue up a readback copy command
+        renderer->vkCmdCopyQueryPoolResults(
+            vulkanCommandBuffer->commandBuffer,
+            renderer->occlusionQueryPool.pool,
+            vulkanQuery->index,
+            1,
+            renderer->occlusionQueryPool.transferBuffer->buffer,
+            vulkanQuery->index * sizeof(Uint64),
+            sizeof(Uint64),
+            VK_QUERY_RESULT_64_BIT);
     }
+}
+
+static bool VULKAN_ReadQuery(
+    SDL_GPURenderer *driverData,
+    SDL_GPUQuery *query,
+    Uint64 *value)
+{
+    VulkanQuery *vulkanQuery = (VulkanQuery *)query;
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+    VkResult result;
+
+    result = renderer->vkGetFenceStatus(
+        renderer->logicalDevice,
+        vulkanQuery->inFlightFence->fence);
+
+    if (result == VK_SUCCESS) {
+        Uint8 *bufferPointer =
+            vulkanQuery->pool->transferBuffer->usedRegion->allocation->mapPointer +
+            vulkanQuery->index * sizeof(Uint64);
+
+        if (vulkanQuery->pool->type == VK_QUERY_TYPE_TIMESTAMP)
+        {
+            Uint64 startTimestamp = ((Uint64 *)bufferPointer)[0];
+            Uint64 endTimestamp = ((Uint64 *)bufferPointer)[1];
+
+            float nanoseconds = (endTimestamp - startTimestamp) / renderer->physicalDeviceProperties.properties.limits.timestampPeriod;
+            *value = (Uint64) nanoseconds;
+        }
+        else
+        {
+            *value = ((Uint64 *)bufferPointer)[0];
+        }
+
+        return true;
+    } else if (result == VK_NOT_READY) {
+        *value = 0;
+        return false;
+    } else {
+        SET_ERROR_AND_RETURN("vkGetFenceStatus: %s", VkErrorMessages(result), false);
+    }
+}
+
+static void VULKAN_ReleaseQuery(
+    SDL_GPURenderer *driverData,
+    SDL_GPUQuery *query)
+{
+    VulkanQuery *vulkanQuery = (VulkanQuery *)query;
+
+    VULKAN_ReleaseFence(driverData, (SDL_GPUFence *)vulkanQuery->inFlightFence);
+    vulkanQuery->inFlightFence = NULL;
 }
 
 static WindowData *VULKAN_INTERNAL_FetchWindowData(
@@ -10694,51 +10737,6 @@ static bool VULKAN_SetAllowedFramesInFlight(
 
 // Submission structure
 
-static VulkanFenceHandle *VULKAN_INTERNAL_AcquireFenceFromPool(
-    VulkanRenderer *renderer)
-{
-    VulkanFenceHandle *handle;
-    VkFenceCreateInfo fenceCreateInfo;
-    VkFence fence;
-    VkResult vulkanResult;
-
-    if (renderer->fencePool.availableFenceCount == 0) {
-        // Create fence
-        fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceCreateInfo.pNext = NULL;
-        fenceCreateInfo.flags = 0;
-
-        vulkanResult = renderer->vkCreateFence(
-            renderer->logicalDevice,
-            &fenceCreateInfo,
-            NULL,
-            &fence);
-
-        CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateFence, NULL);
-
-        handle = SDL_malloc(sizeof(VulkanFenceHandle));
-        handle->fence = fence;
-        SDL_SetAtomicInt(&handle->referenceCount, 0);
-        return handle;
-    }
-
-    SDL_LockMutex(renderer->fencePool.lock);
-
-    handle = renderer->fencePool.availableFences[renderer->fencePool.availableFenceCount - 1];
-    renderer->fencePool.availableFenceCount -= 1;
-
-    vulkanResult = renderer->vkResetFences(
-        renderer->logicalDevice,
-        1,
-        &handle->fence);
-
-    SDL_UnlockMutex(renderer->fencePool.lock);
-
-    CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkResetFences, NULL);
-
-    return handle;
-}
-
 static void VULKAN_INTERNAL_PerformPendingDestroys(
     VulkanRenderer *renderer)
 {
@@ -10807,17 +10805,6 @@ static void VULKAN_INTERNAL_PerformPendingDestroys(
 
             renderer->samplersToDestroy[i] = renderer->samplersToDestroy[renderer->samplersToDestroyCount - 1];
             renderer->samplersToDestroyCount -= 1;
-        }
-    }
-
-    for (Sint32 i = renderer->queryPoolsToDestroyCount - 1; i >= 0; i -= 1){
-        if (SDL_GetAtomicInt(&renderer->queryPoolsToDestroy[i]->referenceCount) == 0) {
-            VULKAN_INTERNAL_DestroyQueryPool(
-                renderer,
-                renderer->queryPoolsToDestroy[i]);
-
-            renderer->queryPoolsToDestroy[i] = renderer->queryPoolsToDestroy[renderer->queryPoolsToDestroyCount - 1];
-            renderer->queryPoolsToDestroyCount -= 1;
         }
     }
 
@@ -10897,11 +10884,6 @@ static void VULKAN_INTERNAL_CleanCommandBuffer(
         (void)SDL_AtomicDecRef(&commandBuffer->usedComputePipelines[i]->referenceCount);
     }
     commandBuffer->usedComputePipelineCount = 0;
-
-    for (Sint32 i = 0; i < commandBuffer->usedQueryPoolCount; i += 1) {
-        (void)(SDL_AtomicDecRef(&commandBuffer->usedQueryPools[i]->referenceCount));
-    }
-    commandBuffer->usedQueryPoolCount = 0;
 
     for (Sint32 i = 0; i < commandBuffer->usedFramebufferCount; i += 1) {
         (void)SDL_AtomicDecRef(&commandBuffer->usedFramebuffers[i]->referenceCount);
@@ -11111,12 +11093,6 @@ static bool VULKAN_Submit(
     }
 
     if (!VULKAN_INTERNAL_EndCommandBuffer(renderer, vulkanCommandBuffer)) {
-        SDL_UnlockMutex(renderer->submitLock);
-        return false;
-    }
-
-    vulkanCommandBuffer->inFlightFence = VULKAN_INTERNAL_AcquireFenceFromPool(renderer);
-    if (vulkanCommandBuffer->inFlightFence == NULL) {
         SDL_UnlockMutex(renderer->submitLock);
         return false;
     }
@@ -13850,6 +13826,72 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
 
     SDL_SetAtomicInt(&renderer->layoutResourceID, 0);
 
+    // Create query pools
+
+    VkQueryPoolCreateInfo vkQueryPoolCreateInfo;
+    vkQueryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    vkQueryPoolCreateInfo.pNext = NULL;
+    vkQueryPoolCreateInfo.flags = 0;
+    vkQueryPoolCreateInfo.pipelineStatistics = 0;
+    vkQueryPoolCreateInfo.queryCount = 1024;
+    vkQueryPoolCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+
+    VkResult vkResult = renderer->vkCreateQueryPool(
+        renderer->logicalDevice,
+        &vkQueryPoolCreateInfo,
+        NULL,
+        &renderer->timestampQueryPool.pool);
+
+    if (vkResult != VK_SUCCESS) {
+        // TODO
+    }
+
+    renderer->timestampQueryPool.nextIndex = 0;
+    renderer->timestampQueryPool.type = VK_QUERY_TYPE_TIMESTAMP;
+    renderer->timestampQueryPool.transferBuffer = VULKAN_INTERNAL_CreateBuffer(
+        renderer,
+        1024 * sizeof(Uint64),
+        0,
+        VULKAN_BUFFER_TYPE_TRANSFER,
+        true,
+        "Timestamp Query Transfer Buffer");
+
+    for (i = 0; i < 1024; i += 1)
+    {
+        renderer->timestampQueryPool.queries[i].pool = &renderer->timestampQueryPool;
+        renderer->timestampQueryPool.queries[i].index = i;
+        renderer->timestampQueryPool.queries[i].inFlightFence = NULL;
+    }
+
+    vkQueryPoolCreateInfo.queryType = VK_QUERY_TYPE_OCCLUSION;
+
+    vkResult = renderer->vkCreateQueryPool(
+        renderer->logicalDevice,
+        &vkQueryPoolCreateInfo,
+        NULL,
+        &renderer->occlusionQueryPool.pool);
+
+    if (vkResult != VK_SUCCESS) {
+        // TODO
+    }
+
+    renderer->occlusionQueryPool.nextIndex = 0;
+    renderer->occlusionQueryPool.type = VK_QUERY_TYPE_OCCLUSION;
+    renderer->occlusionQueryPool.transferBuffer = VULKAN_INTERNAL_CreateBuffer(
+        renderer,
+        1024 * sizeof(Uint64),
+        0,
+        VULKAN_BUFFER_TYPE_TRANSFER,
+        true,
+        "Occlusion Query Transfer Buffer");
+
+    for (i = 0; i < 1024; i += 1)
+    {
+        renderer->occlusionQueryPool.queries[i].pool = &renderer->occlusionQueryPool;
+        renderer->occlusionQueryPool.queries[i].index = i;
+        renderer->occlusionQueryPool.queries[i].inFlightFence = NULL;
+    }
+
     // Device limits
 
     renderer->minUBOAlignment = (Uint32)renderer->physicalDeviceProperties.properties.limits.minUniformBufferOffsetAlignment;
@@ -13956,13 +13998,6 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
     renderer->shadersToDestroy = SDL_malloc(
         sizeof(VulkanShader *) *
         renderer->shadersToDestroyCapacity);
-
-    renderer->queryPoolsToDestroyCapacity = 16;
-    renderer->queryPoolsToDestroyCount = 0;
-
-    renderer->queryPoolsToDestroy = SDL_malloc(
-        sizeof(VulkanQueryPool *) *
-        renderer->queryPoolsToDestroyCapacity);
 
     renderer->framebuffersToDestroyCapacity = 16;
     renderer->framebuffersToDestroyCount = 0;

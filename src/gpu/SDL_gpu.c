@@ -3020,36 +3020,6 @@ void SDL_DownloadFromGPUBuffer(
         destination);
 }
 
-void SDL_DownloadGPUQueryResults(
-    SDL_GPUCopyPass *copy_pass,
-    SDL_GPUQueryPool *pool,
-    Uint32 first_query,
-    Uint32 count,
-    SDL_GPUTransferBufferLocation *destination)
-{
-    CHECK_PARAM(copy_pass == NULL) {
-        SDL_InvalidParamError("copy_pass");
-        return;
-    }
-
-    CHECK_PARAM(pool == NULL) {
-        SDL_InvalidParamError("pool");
-        return;
-    }
-
-    CHECK_PARAM(destination == NULL) {
-        SDL_InvalidParamError("destination");
-        return;
-    }
-
-    COPYPASS_DEVICE->DownloadQueryResults(
-        COPYPASS_COMMAND_BUFFER,
-        pool,
-        first_query,
-        count,
-        destination);
-}
-
 void SDL_EndGPUCopyPass(
     SDL_GPUCopyPass *copy_pass)
 {
@@ -3541,84 +3511,68 @@ void SDL_ReleaseGPUFence(
         fence);
 }
 
-float SDL_GetGPUTimestampFrequency(SDL_GPUDevice *device)
-{
-    CHECK_DEVICE_MAGIC(device, 0);
-
-    return device->GetTimestampFrequency(device->driverData);
-}
-
-SDL_GPUQueryPool *SDL_CreateGPUQueryPool(
-    SDL_GPUDevice *device,
-    SDL_GPUQueryPoolCreateInfo *createinfo)
-{
-    CHECK_DEVICE_MAGIC(device, NULL);
-
-    CHECK_PARAM(createinfo == NULL) {
-        SDL_InvalidParamError("createinfo");
-        return NULL;
-    }
-
-    return device->CreateQueryPool(
-        device->driverData,
-        createinfo);
-}
-
-void SDL_BeginGPUQuery(
+SDL_GPUQuery *SDL_BeginGPUQuery(
     SDL_GPUCommandBuffer *command_buffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 index)
+    SDL_GPUQueryType type,
+    SDL_PropertiesID props)
 {
     CHECK_PARAM(command_buffer == NULL) {
         SDL_InvalidParamError("command_buffer");
-        return;
+        return NULL;
     }
 
-    CHECK_PARAM(pool == NULL) {
-        SDL_InvalidParamError("pool");
-        return;
-    }
-
-    COMMAND_BUFFER_DEVICE->BeginQuery(
+    return COMMAND_BUFFER_DEVICE->BeginQuery(
         command_buffer,
-        pool,
-        index);
+        type,
+        props);
 }
 
 void SDL_EndGPUQuery(
     SDL_GPUCommandBuffer *command_buffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 index)
+    SDL_GPUQuery *query)
 {
-    CHECK_PARAM(command_buffer == NULL) {
-        SDL_InvalidParamError("command_buffer");
-        return;
-    }
-
-    CHECK_PARAM(pool == NULL) {
-        SDL_InvalidParamError("pool");
+    CHECK_PARAM(query == NULL) {
+        SDL_InvalidParamError("query");
         return;
     }
 
     COMMAND_BUFFER_DEVICE->EndQuery(
         command_buffer,
-        pool,
-        index);
+        query);
 }
 
-void SDL_ReleaseGPUQueryPool(
+bool SDL_ReadGPUQuery(
     SDL_GPUDevice *device,
-    SDL_GPUQueryPool *pool)
+    SDL_GPUQuery *query,
+    Uint64 *value)
 {
-    CHECK_DEVICE_MAGIC(device, );
+    CHECK_DEVICE_MAGIC(device, false);
 
-    CHECK_PARAM(pool == NULL) {
+    CHECK_PARAM(query == NULL) {
+        SDL_InvalidParamError("query");
+        return false;
+    }
+
+    return device->ReadQuery(
+        device->driverData,
+        query,
+        value);
+}
+
+void SDL_ReleaseGPUQuery(
+    SDL_GPUDevice *device,
+    SDL_GPUQuery *query)
+{
+    CHECK_DEVICE_MAGIC(device,);
+
+    CHECK_PARAM(query == NULL) {
+        SDL_InvalidParamError("query");
         return;
     }
 
-    return device->ReleaseQueryPool(
+    return device->ReleaseQuery(
         device->driverData,
-        pool);
+        query);
 }
 
 Uint32 SDL_CalculateGPUTextureFormatSize(

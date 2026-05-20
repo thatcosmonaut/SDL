@@ -602,14 +602,13 @@ typedef struct SDL_GPUFence SDL_GPUFence;
  *
  * \since This struct is available since SDL 3.6.0.
  *
- * \sa SDL_CreateGPUQueryPool
- * \sa SDL_ReleaseGPUQueryPool
+ * \sa SDL_AcquireGPUQuery
+ * \sa SDL_ReleaseGPUQuery
  * \sa SDL_BeginGPUQuery
  * \sa SDL_EndGPUQuery
- * \sa SDL_DownloadGPUQueryResults
- * \sa SDL_GetGPUTimestampFrequency
+ * \sa SDL_ReadGPUQuery
  */
-typedef struct SDL_GPUQueryPool SDL_GPUQueryPool;
+typedef struct SDL_GPUQuery SDL_GPUQuery;
 
 /**
  * Specifies the primitive topology of a graphics pipeline.
@@ -1393,7 +1392,7 @@ typedef enum SDL_GPUSwapchainComposition
  */
 typedef enum SDL_GPUQueryType
 {
-    SDL_GPU_QUERY_TIMESTAMP,
+    SDL_GPU_QUERY_TIME_INTERVAL,
     SDL_GPU_QUERY_BINARY_OCCLUSION,
     SDL_GPU_QUERY_PRECISE_OCCLUSION
 } SDL_GPUQueryType;
@@ -4072,30 +4071,6 @@ extern SDL_DECLSPEC void SDLCALL SDL_DownloadFromGPUBuffer(
     const SDL_GPUTransferBufferLocation *destination);
 
 /**
- * Copies results of a GPU query to a buffer.
- *
- * This data is not guaranteed to be copied until the command buffer fence is
- * signaled.
- *
- * After this function is called, the data in the query pool is no longer valid,
- * so don't call this function multiple times before performing another query.
- *
- * \param copy_pass a copy pass handle.
- * \param pool a query pool handle.
- * \param first_query starting index of the queries to copy.
- * \param count the number of queries to copy.
- * \param destination the destination buffer and offset.
- *
- * \since This struct is available since SDL 3.6.0.
- */
-extern SDL_DECLSPEC void SDLCALL SDL_DownloadGPUQueryResults(
-    SDL_GPUCopyPass *copy_pass,
-    SDL_GPUQueryPool *pool,
-    Uint32 first_query,
-    Uint32 count,
-    SDL_GPUTransferBufferLocation *destination);
-
-/**
  * Ends the current copy pass.
  *
  * \param copy_pass a copy pass handle.
@@ -4560,92 +4535,77 @@ extern SDL_DECLSPEC void SDLCALL SDL_ReleaseGPUFence(
     SDL_GPUFence *fence);
 
 /**
- * Gets GPU timestamp frequency.
+ * Begins a query on a command buffer.
  *
- * Use this to compute wall clock times from timestamps.
+ * For time interval queries, this will produce a timestamp as soon as all previous commands are taken by the command queue.
  *
- * \param device a GPU context.
- * \returns the number of nanoseconds required for a timestamp query to be incremented by 1.
- *
- * \since This function is available since SDL 3.6.0.
- *
- * \sa SDL_CreateGPUQueryPool
- */
-extern SDL_DECLSPEC float SDLCALL SDL_GetGPUTimestampFrequency(SDL_GPUDevice *device);
-
-/**
- * Creates a query pool object to be used in queries.
- *
- * \param device a GPU context.
- * \param createinfo a struct describing the state of the pool to create.
- * \returns a query pool object on success, or NULL on failure; call
+ * \param command_buffer a command buffer.
+ * \param type the type of query.
+ * \param props a properties ID used for extensions. Should be 0 if not needed.
+ * \returns a query object on success, or NULL on failure; call
  *          SDL_GetError() for more information.
  *
  * \since This function is available since SDL 3.6.0.
  *
- * \sa SDL_GetGPUTimestampFrequency
- * \sa SDL_BeginGPUQuery
  * \sa SDL_EndGPUQuery
- * \sa SDL_DownloadGPUQueryResults
- * \sa SDL_ReleaseGPUQueryPool
+ * \sa SDL_ReadGPUQuery
+ * \sa SDL_ReleaseGPUQuery
  */
-extern SDL_DECLSPEC SDL_GPUQueryPool * SDLCALL SDL_CreateGPUQueryPool(
-    SDL_GPUDevice *device,
-    SDL_GPUQueryPoolCreateInfo *createinfo);
-
-/**
- * Begins a query on a command buffer.
- *
- * For timestamp queries, this will produce a timestamp as soon as all previous commands are taken by the command queue.
- * Note that this means for timestamp queries you should use a different index from the one you use in SDL_EndGPUQuery.
- *
- * \param command_buffer a command buffer.
- * \param pool a query pool.
- * \param index the index within the pool for the query.
- *
- * \since This function is available since SDL 3.6.0.
- *
- * \sa SDL_EndGPUQuery
- */
-extern SDL_DECLSPEC void SDLCALL SDL_BeginGPUQuery(
+extern SDL_DECLSPEC SDL_GPUQuery * SDLCALL SDL_BeginGPUQuery(
     SDL_GPUCommandBuffer *command_buffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 index);
+    SDL_GPUQueryType type,
+    SDL_PropertiesID props);
 
 /**
  * Ends a query on a command buffer.
  *
- * For timestamp queries, this will produce a timestamp as soon as all previous commands are finished in the command queue.
- * Note that this means for timestamp queries you should use a different index from the one you used in SDL_BeginGPUQuery.
+ * For time interval queries, this will produce a timestamp as soon as all previous commands are finished in the command queue.
  *
- * \param command_buffer a command buffer.
- * \param pool a query pool.
- * \param index the index within the pool for the query.
+ * \param command_buffer a command buffer. This must be the same command buffer as the one used in SDL_BeginGPUQuery.
+ * \param query a query object.
  *
  * \since This function is available since SDL 3.6.0.
  *
  * \sa SDL_BeginGPUQuery
+ * \sa SDL_ReadGPUQuery
+ * \sa SDL_ReleaseGPUQuery
  */
 extern SDL_DECLSPEC void SDLCALL SDL_EndGPUQuery(
     SDL_GPUCommandBuffer *command_buffer,
-    SDL_GPUQueryPool *pool,
-    Uint32 index);
+    SDL_GPUQuery *query);
 
 /**
- * Frees the given query pool as soon as it is safe to do so.
+ * Attempts to read the result of a query.
  *
- * You must not reference the query pool after calling this function.
+ * Note that the query will not execute until its associated command buffer has been submitted.
  *
  * \param device a GPU context.
- * \param pool a query pool.
+ * \param query a query object.
+ * \param value a pointer filled in with the result of the query.
+ * \returns true if the query was finished, false otherwise.
+ *
+ * \since This function is available since SDL 3.6.0.
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_ReadGPUQuery(
+    SDL_GPUDevice *device,
+    SDL_GPUQuery *query,
+    Uint64 *value);
+
+/**
+ * Releases the given query object.
+ *
+ * You must not reference the query after calling this function.
+ *
+ * \param device a GPU context.
+ * \param query a query.
  *
  * \since This function is available since SDL 3.6.0.
  *
  * \sa SDL_CreateGPUQueryPool
  */
-extern SDL_DECLSPEC void SDLCALL SDL_ReleaseGPUQueryPool(
+extern SDL_DECLSPEC void SDLCALL SDL_ReleaseGPUQuery(
     SDL_GPUDevice *device,
-    SDL_GPUQueryPool *pool);
+    SDL_GPUQuery *query);
 
 /* Format Info */
 

@@ -995,13 +995,6 @@ struct SDL_GPUDevice
         Uint32 size,
         bool cycle);
 
-    void (*DownloadQueryResults)(
-        SDL_GPUCommandBuffer *commandBuffer,
-        SDL_GPUQueryPool *pool,
-        Uint32 first_query,
-        Uint32 count,
-        const SDL_GPUTransferBufferLocation *destination);
-
     void (*GenerateMipmaps)(
         SDL_GPUCommandBuffer *commandBuffer,
         SDL_GPUTexture *texture);
@@ -1104,27 +1097,23 @@ struct SDL_GPUDevice
         SDL_GPURenderer *driverData,
         SDL_GPUFence *fence);
 
-    float (*GetTimestampFrequency)(
-        SDL_GPURenderer *device
-    );
-
-    SDL_GPUQueryPool *(*CreateQueryPool)(
-        SDL_GPURenderer *driverData,
-        SDL_GPUQueryPoolCreateInfo *createinfo);
-
-    void (*BeginQuery)(
-        SDL_GPUCommandBuffer *commandBuffer,
-        SDL_GPUQueryPool *pool,
-        Uint32 index);
+    SDL_GPUQuery *(*BeginQuery)(
+        SDL_GPUCommandBuffer *command_buffer,
+        SDL_GPUQueryType type,
+        SDL_PropertiesID props);
 
     void (*EndQuery)(
-        SDL_GPUCommandBuffer *commandBuffer,
-        SDL_GPUQueryPool *pool,
-        Uint32 index);
+        SDL_GPUCommandBuffer *command_buffer,
+        SDL_GPUQuery *query);
 
-    void (*ReleaseQueryPool)(
+    bool (*ReadQuery)(
         SDL_GPURenderer *driverData,
-        SDL_GPUQueryPool *pool);
+        SDL_GPUQuery *query,
+        Uint64 *value);
+
+    void (*ReleaseQuery)(
+        SDL_GPURenderer *driverData,
+        SDL_GPUQuery *query);
 
     // Feature Queries
 
@@ -1222,7 +1211,6 @@ struct SDL_GPUDevice
     ASSIGN_DRIVER_FUNC(DownloadFromBuffer, name)            \
     ASSIGN_DRIVER_FUNC(CopyTextureToTexture, name)          \
     ASSIGN_DRIVER_FUNC(CopyBufferToBuffer, name)            \
-    ASSIGN_DRIVER_FUNC(DownloadQueryResults, name)          \
     ASSIGN_DRIVER_FUNC(GenerateMipmaps, name)               \
     ASSIGN_DRIVER_FUNC(EndCopyPass, name)                   \
     ASSIGN_DRIVER_FUNC(Blit, name)                          \
@@ -1244,11 +1232,10 @@ struct SDL_GPUDevice
     ASSIGN_DRIVER_FUNC(WaitForFences, name)                 \
     ASSIGN_DRIVER_FUNC(QueryFence, name)                    \
     ASSIGN_DRIVER_FUNC(ReleaseFence, name)                  \
-    ASSIGN_DRIVER_FUNC(GetTimestampFrequency, name)         \
-    ASSIGN_DRIVER_FUNC(CreateQueryPool, name)               \
     ASSIGN_DRIVER_FUNC(BeginQuery, name)                    \
     ASSIGN_DRIVER_FUNC(EndQuery, name)                      \
-    ASSIGN_DRIVER_FUNC(ReleaseQueryPool, name)              \
+    ASSIGN_DRIVER_FUNC(ReadQuery, name)                     \
+    ASSIGN_DRIVER_FUNC(ReleaseQuery, name)                  \
     ASSIGN_DRIVER_FUNC(SupportsTextureFormat, name)         \
     ASSIGN_DRIVER_FUNC(SupportsSampleCount, name)
 
