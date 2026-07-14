@@ -57,6 +57,9 @@ typedef struct RenderState
     SDL_GPUBuffer *buf_vertex;
     SDL_GPUGraphicsPipeline *pipeline;
     SDL_GPUSampleCount sample_count;
+    SDL_GPUQueryPool *occlusion_query_pool;
+    SDL_GPUTransferBuffer *occlusion_query_transfer;
+    bool occlusion_query_pending;
 } RenderState;
 
 #define NUM_SPRITES         100
@@ -378,6 +381,8 @@ static void shutdownGPU(void)
 
     SDL_ReleaseGPUBuffer(gpu_device, render_state.buf_vertex);
     SDL_ReleaseGPUGraphicsPipeline(gpu_device, render_state.pipeline);
+    SDL_ReleaseGPUQueryPool(gpu_device, render_state.occlusion_query_pool);
+    SDL_ReleaseGPUTransferBuffer(gpu_device, render_state.occlusion_query_transfer);
     SDL_DestroyGPUDevice(gpu_device);
 
     SDL_zero(render_state);
@@ -731,6 +736,7 @@ static void Render(SDL_Window *window, const int windownum)
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
     depth_target.texture = winstate->tex_depth;
     depth_target.cycle = true;
+    depth_target.query_pool = render_state.occlusion_query_pool;
 
     /* Set up the bindings */
 
@@ -744,8 +750,25 @@ static void Render(SDL_Window *window, const int windownum)
     pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target);
     SDL_BindGPUGraphicsPipeline(pass, render_state.pipeline);
     SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
+    SDL_BeginGPUQuery(cmd, render_state.occlusion_query_pool, 0);
     SDL_DrawGPUPrimitives(pass, 36, 1, 0, 0);
+    SDL_EndGPUQuery(cmd, render_state.occlusion_query_pool, 0);
     SDL_EndGPURenderPass(pass);
+
+    /* Occlusion query proof-of-concept: schedule a download of this frame's
+     * query result. A real application would defer reading the result to a
+     * later frame instead of blocking after submit, as done below. */
+    {
+        SDL_GPUCopyPass *copy_pass;
+        SDL_GPUTransferBufferLocation query_dst;
+
+        query_dst.transfer_buffer = render_state.occlusion_query_transfer;
+        query_dst.offset = 0;
+
+        copy_pass = SDL_BeginGPUCopyPass(cmd);
+        SDL_DownloadGPUQueryResults(copy_pass, render_state.occlusion_query_pool, 0, 1, &query_dst);
+        SDL_EndGPUCopyPass(copy_pass);
+    }
 
     /* Render the sprite overlay! */
 
@@ -776,7 +799,20 @@ static void Render(SDL_Window *window, const int windownum)
     }
 
     /* Submit the command buffer! */
-    SDL_SubmitGPUCommandBuffer(cmd);
+    if ((frames % 60) == 0) {
+        /* Occlusion query proof-of-concept: block on this frame's fence and
+         * print the result. A real application should defer this to a later
+         * frame instead of stalling the pipeline like this. */
+        SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        SDL_WaitForGPUFences(gpu_device, true, &fence, 1);
+        SDL_ReleaseGPUFence(gpu_device, fence);
+
+        Uint64 *result = (Uint64 *)SDL_MapGPUTransferBuffer(gpu_device, render_state.occlusion_query_transfer, false);
+        SDL_Log("Occlusion query result: %" SDL_PRIu64 " samples passed", *result);
+        SDL_UnmapGPUTransferBuffer(gpu_device, render_state.occlusion_query_transfer);
+    } else {
+        SDL_SubmitGPUCommandBuffer(cmd);
+    }
 
     ++frames;
 }
@@ -950,6 +986,25 @@ static void init_render_state(int msaa)
     /* These are reference-counted; once the pipeline is created, you don't need to keep these. */
     SDL_ReleaseGPUShader(gpu_device, vertex_shader);
     SDL_ReleaseGPUShader(gpu_device, fragment_shader);
+
+    /* Occlusion query proof-of-concept: wraps the cube draw and downloads the
+     * result one frame later, printed periodically below. */
+    {
+        SDL_GPUQueryPoolCreateInfo query_pool_createinfo;
+        SDL_GPUTransferBufferCreateInfo transfer_createinfo;
+
+        SDL_zero(query_pool_createinfo);
+        query_pool_createinfo.type = SDL_GPU_QUERY_PRECISE_OCCLUSION;
+        query_pool_createinfo.query_count = 1;
+        render_state.occlusion_query_pool = SDL_CreateGPUQueryPool(gpu_device, &query_pool_createinfo);
+        CHECK_CREATE(render_state.occlusion_query_pool, "Occlusion query pool")
+
+        SDL_zero(transfer_createinfo);
+        transfer_createinfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+        transfer_createinfo.size = sizeof(Uint64);
+        render_state.occlusion_query_transfer = SDL_CreateGPUTransferBuffer(gpu_device, &transfer_createinfo);
+        CHECK_CREATE(render_state.occlusion_query_transfer, "Occlusion query transfer buffer")
+    }
 
     /* Set up per-window state */
 

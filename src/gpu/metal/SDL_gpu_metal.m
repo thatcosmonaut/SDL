@@ -533,6 +533,14 @@ typedef struct MetalUniformBuffer
     Uint32 drawOffset;
 } MetalUniformBuffer;
 
+typedef struct MetalQueryPool
+{
+    SDL_GPUQueryType type;
+    Uint32 queryCount;
+    id<MTLBuffer> resultBuffer;
+    SDL_AtomicInt referenceCount;
+} MetalQueryPool;
+
 typedef struct MetalCommandBuffer
 {
     CommandBufferCommonHeader common;
@@ -617,6 +625,10 @@ typedef struct MetalCommandBuffer
     MetalTexture **usedTextures;
     Uint32 usedTextureCount;
     Uint32 usedTextureCapacity;
+
+    MetalQueryPool **usedQueryPools;
+    Uint32 usedQueryPoolCount;
+    Uint32 usedQueryPoolCapacity;
 } MetalCommandBuffer;
 
 typedef struct MetalSampler
@@ -669,6 +681,10 @@ struct MetalRenderer
     MetalTextureContainer **textureContainersToDestroy;
     Uint32 textureContainersToDestroyCount;
     Uint32 textureContainersToDestroyCapacity;
+
+    MetalQueryPool **queryPoolsToDestroy;
+    Uint32 queryPoolsToDestroyCount;
+    Uint32 queryPoolsToDestroyCapacity;
 
     // Blit
     SDL_GPUShader *blitVertexShader;
@@ -732,12 +748,14 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
     // Release destroyed resource lists
     SDL_free(renderer->bufferContainersToDestroy);
     SDL_free(renderer->textureContainersToDestroy);
+    SDL_free(renderer->queryPoolsToDestroy);
 
     // Release command buffer infrastructure
     for (Uint32 i = 0; i < renderer->availableCommandBufferCount; i += 1) {
         MetalCommandBuffer *commandBuffer = renderer->availableCommandBuffers[i];
         SDL_free(commandBuffer->usedBuffers);
         SDL_free(commandBuffer->usedTextures);
+        SDL_free(commandBuffer->usedQueryPools);
         SDL_free(commandBuffer->usedUniformBuffers);
         SDL_free(commandBuffer->windowDatas);
         SDL_free(commandBuffer);
@@ -800,6 +818,18 @@ static void METAL_INTERNAL_TrackTexture(
         usedTextures,
         usedTextureCount,
         usedTextureCapacity);
+}
+
+static void METAL_INTERNAL_TrackQueryPool(
+    MetalCommandBuffer *commandBuffer,
+    MetalQueryPool *queryPool)
+{
+    TRACK_RESOURCE(
+        queryPool,
+        MetalQueryPool *,
+        usedQueryPools,
+        usedQueryPoolCount,
+        usedQueryPoolCapacity);
 }
 
 static void METAL_INTERNAL_TrackUniformBuffer(
@@ -2065,6 +2095,11 @@ static void METAL_INTERNAL_AllocateCommandBuffers(
         commandBuffer->usedTextures = SDL_calloc(
             commandBuffer->usedTextureCapacity, sizeof(MetalTexture *));
 
+        commandBuffer->usedQueryPoolCapacity = 4;
+        commandBuffer->usedQueryPoolCount = 0;
+        commandBuffer->usedQueryPools = SDL_calloc(
+            commandBuffer->usedQueryPoolCapacity, sizeof(MetalQueryPool *));
+
         renderer->availableCommandBuffers[renderer->availableCommandBufferCount] = commandBuffer;
         renderer->availableCommandBufferCount += 1;
     }
@@ -2287,6 +2322,13 @@ static void METAL_BeginRenderPass(
         SDL_GPUViewport viewport;
         SDL_Rect scissorRect;
         SDL_FColor blendConstants;
+
+        if (depthStencilTargetInfo) {
+            MetalQueryPool *pool = (MetalQueryPool *) depthStencilTargetInfo->query_pool;
+            if (pool && (pool->type == SDL_GPU_QUERY_BINARY_OCCLUSION || pool->type == SDL_GPU_QUERY_PRECISE_OCCLUSION)) {
+                passDescriptor.visibilityResultBuffer = pool->resultBuffer;
+            }
+        }
 
         for (Uint32 i = 0; i < numColorTargets; i += 1) {
             MetalTextureContainer *container = (MetalTextureContainer *)colorTargetInfos[i].texture;
@@ -3413,6 +3455,120 @@ static void METAL_ReleaseFence(
     }
 }
 
+// Queries
+
+static float METAL_GetTimestampFrequency(SDL_GPURenderer *driverData)
+{
+    // Timestamp queries are not currently supported by this backend.
+    return 0.0f;
+}
+
+static SDL_GPUQueryPool *METAL_CreateQueryPool(
+    SDL_GPURenderer *driverData,
+    SDL_GPUQueryPoolCreateInfo *createinfo)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+
+    MetalQueryPool *pool = SDL_calloc(1, sizeof(MetalQueryPool));
+    pool->type = createinfo->type;
+    pool->queryCount = createinfo->query_count;
+
+    MetalBuffer *buffer = METAL_INTERNAL_CreateBuffer(
+        renderer,
+        createinfo->query_count * sizeof(Uint64),
+        MTLResourceStorageModeShared,
+        "SDL_GPU Query Buffer");
+    pool->resultBuffer = buffer->handle;
+    buffer->handle = nil;
+    SDL_free(buffer);
+
+    SDL_SetAtomicInt(&pool->referenceCount, 0);
+
+    return (SDL_GPUQueryPool *)pool;
+}
+
+static void METAL_ReleaseQueryPool(
+    SDL_GPURenderer *driverData,
+    SDL_GPUQueryPool *pool)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+    MetalQueryPool *metalQueryPool = (MetalQueryPool *)pool;
+
+    SDL_LockMutex(renderer->disposeLock);
+
+    EXPAND_ARRAY_IF_NEEDED(
+        renderer->queryPoolsToDestroy,
+        MetalQueryPool *,
+        renderer->queryPoolsToDestroyCount + 1,
+        renderer->queryPoolsToDestroyCapacity,
+        renderer->queryPoolsToDestroyCapacity + 1);
+
+    renderer->queryPoolsToDestroy[renderer->queryPoolsToDestroyCount] = metalQueryPool;
+    renderer->queryPoolsToDestroyCount += 1;
+
+    SDL_UnlockMutex(renderer->disposeLock);
+}
+
+static MTLVisibilityResultMode METAL_INTERNAL_QueryMode(SDL_GPUQueryType type)
+{
+    return type == SDL_GPU_QUERY_PRECISE_OCCLUSION
+        ? MTLVisibilityResultModeCounting
+        : MTLVisibilityResultModeBoolean;
+}
+
+static void METAL_BeginQuery(
+    SDL_GPUCommandBuffer *commandBuffer,
+    SDL_GPUQueryPool *pool,
+    Uint32 index)
+{
+    MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
+    MetalQueryPool *metalPool = (MetalQueryPool *)pool;
+
+    [metalCommandBuffer->renderEncoder
+        setVisibilityResultMode:METAL_INTERNAL_QueryMode(metalPool->type)
+                          offset:index * sizeof(Uint64)];
+
+    METAL_INTERNAL_TrackQueryPool(metalCommandBuffer, metalPool);
+}
+
+static void METAL_EndQuery(
+    SDL_GPUCommandBuffer *commandBuffer,
+    SDL_GPUQueryPool *pool,
+    Uint32 index)
+{
+    MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
+
+    [metalCommandBuffer->renderEncoder
+        setVisibilityResultMode:MTLVisibilityResultModeDisabled
+                          offset:index * sizeof(Uint64)];
+}
+
+static void METAL_DownloadQueryResults(
+    SDL_GPUCommandBuffer *commandBuffer,
+    SDL_GPUQueryPool *pool,
+    Uint32 first_query,
+    Uint32 count,
+    const SDL_GPUTransferBufferLocation *destination)
+{
+    @autoreleasepool {
+        MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
+        MetalRenderer *renderer = metalCommandBuffer->renderer;
+        MetalQueryPool *metalPool = (MetalQueryPool *)pool;
+        MetalBufferContainer *dstContainer = (MetalBufferContainer *)destination->transfer_buffer;
+        MetalBuffer *dstBuffer = METAL_INTERNAL_PrepareBufferForWrite(renderer, dstContainer, false);
+
+        [metalCommandBuffer->blitEncoder
+               copyFromBuffer:metalPool->resultBuffer
+                 sourceOffset:first_query * sizeof(Uint64)
+                     toBuffer:dstBuffer->handle
+            destinationOffset:destination->offset
+                         size:count * sizeof(Uint64)];
+
+        METAL_INTERNAL_TrackQueryPool(metalCommandBuffer, metalPool);
+        METAL_INTERNAL_TrackBuffer(metalCommandBuffer, dstBuffer);
+    }
+}
+
 // Cleanup
 
 static void METAL_INTERNAL_CleanCommandBuffer(
@@ -3460,6 +3616,11 @@ static void METAL_INTERNAL_CleanCommandBuffer(
         (void)SDL_AtomicDecRef(&commandBuffer->usedTextures[i]->referenceCount);
     }
     commandBuffer->usedTextureCount = 0;
+
+    for (i = 0; i < commandBuffer->usedQueryPoolCount; i += 1) {
+        (void)SDL_AtomicDecRef(&commandBuffer->usedQueryPools[i]->referenceCount);
+    }
+    commandBuffer->usedQueryPoolCount = 0;
 
     // Reset presentation
     commandBuffer->windowDataCount = 0;
@@ -3580,6 +3741,16 @@ static void METAL_INTERNAL_PerformPendingDestroys(
 
             renderer->textureContainersToDestroy[i] = renderer->textureContainersToDestroy[renderer->textureContainersToDestroyCount - 1];
             renderer->textureContainersToDestroyCount -= 1;
+        }
+    }
+
+    for (i = renderer->queryPoolsToDestroyCount - 1; i >= 0; i -= 1) {
+        if (SDL_GetAtomicInt(&renderer->queryPoolsToDestroy[i]->referenceCount) == 0) {
+            renderer->queryPoolsToDestroy[i]->resultBuffer = nil;
+            SDL_free(renderer->queryPoolsToDestroy[i]);
+
+            renderer->queryPoolsToDestroy[i] = renderer->queryPoolsToDestroy[renderer->queryPoolsToDestroyCount - 1];
+            renderer->queryPoolsToDestroyCount -= 1;
         }
     }
 
@@ -4694,6 +4865,11 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         renderer->textureContainersToDestroyCount = 0;
         renderer->textureContainersToDestroy = SDL_calloc(
             renderer->textureContainersToDestroyCapacity, sizeof(MetalTextureContainer *));
+
+        renderer->queryPoolsToDestroyCapacity = 2;
+        renderer->queryPoolsToDestroyCount = 0;
+        renderer->queryPoolsToDestroy = SDL_calloc(
+            renderer->queryPoolsToDestroyCapacity, sizeof(MetalQueryPool *));
 
         // Create claimed window list
         renderer->claimedWindowCapacity = 1;

@@ -598,6 +598,13 @@ typedef struct SDL_GPUCopyPass SDL_GPUCopyPass;
 typedef struct SDL_GPUFence SDL_GPUFence;
 
 /**
+ * Feature-detection macro for the occlusion/timestamp query API so that
+ * downstream projects may conditionalize their use of it until it is merged.
+ * This can be deleted upon merging https://github.com/libsdl-org/SDL/pull/15651
+ */
+#define SDL_GPU_QUERY_API 1
+
+/**
  * An opaque handle representing a query pool.
  *
  * \since This struct is available since SDL 3.6.0.
@@ -2135,6 +2142,7 @@ typedef struct SDL_GPUDepthStencilTargetInfo
     Uint8 clear_stencil;                   /**< The value to clear the stencil component to at the beginning of the render pass. Ignored if SDL_GPU_LOADOP_CLEAR is not used. */
     Uint8 mip_level;                       /**< The mip level to use as the depth stencil target. */
     Uint8 layer;                           /**< The layer index to use as the depth stencil target. */
+    SDL_GPUQueryPool *query_pool;           /**< The query pool to which query results will be written during the render pass. */
 } SDL_GPUDepthStencilTargetInfo;
 
 /**
